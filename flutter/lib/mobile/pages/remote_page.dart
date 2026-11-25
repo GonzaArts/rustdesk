@@ -25,6 +25,7 @@ import '../../models/shortcut_model.dart';
 import '../../utils/image.dart';
 import '../widgets/dialog.dart';
 import '../widgets/custom_scale_widget.dart';
+import '../widgets/android_soft_keyboard_backspace.dart';
 
 final initText = '1' * 1024;
 
@@ -730,30 +731,44 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
               height: 0,
               child: !_showEdit
                   ? Container()
-                  : TextFormField(
-                      textInputAction: TextInputAction.newline,
-                      autocorrect: false,
-                      // Flutter 3.16.9 Android.
-                      // `enableSuggestions` causes secure keyboard to be shown.
-                      // https://github.com/flutter/flutter/issues/139143
-                      // https://github.com/flutter/flutter/issues/146540
-                      // enableSuggestions: false,
-                      autofocus: true,
-                      focusNode: _mobileFocusNode,
-                      maxLines: null,
+                  : AndroidSoftKeyboardBackspaceGuard(
+                      enabled: isAndroid,
                       controller: _textController,
-                      // trick way to make backspace work always
-                      keyboardType: TextInputType.multiline,
-                      // `onChanged` may be called depending on the input method if this widget is wrapped in
-                      // `Focus(onKeyEvent: ..., child: ...)`
-                      // For `Backspace` button in the soft keyboard:
-                      // en/fr input method:
-                      //      1. The button will not trigger `onKeyEvent` if the text field is not empty.
-                      //      2. The button will trigger `onKeyEvent` if the text field is empty.
-                      // ko/zh/ja input method: the button will trigger `onKeyEvent`
-                      //                     and the event will not popup if `KeyEventResult.handled` is returned.
+                      canHandle: () =>
+                          _mobileFocusNode.hasFocus &&
+                          inputModel.keyboardInputAllowed &&
+                          inputModel.keyboardPerm &&
+                          !inputModel.isViewOnly &&
+                          !inputModel.isViewCamera &&
+                          !inputModel.ctrl &&
+                          !inputModel.alt &&
+                          !inputModel.command,
                       onChanged: handleSoftKeyboardInput,
-                    ).workaroundFreezeLinuxMint(),
+                      child: TextFormField(
+                          textInputAction: TextInputAction.newline,
+                          autocorrect: false,
+                          // Flutter 3.16.9 Android.
+                          // `enableSuggestions` causes secure keyboard to be shown.
+                          // https://github.com/flutter/flutter/issues/139143
+                          // https://github.com/flutter/flutter/issues/146540
+                          // enableSuggestions: false,
+                          autofocus: true,
+                          focusNode: _mobileFocusNode,
+                          maxLines: null,
+                          controller: _textController,
+                          // trick way to make backspace work always
+                          keyboardType: TextInputType.multiline,
+                          // `onChanged` may be called depending on the input method if this widget is wrapped in
+                          // `Focus(onKeyEvent: ..., child: ...)`
+                          // For `Backspace` button in the soft keyboard:
+                          // en/fr input method:
+                          //      1. The button will not trigger `onKeyEvent` if the text field is not empty.
+                          //      2. The button will trigger `onKeyEvent` if the text field is empty.
+                          // ko/zh/ja input method: the button will trigger `onKeyEvent`
+                          //                     and the event will not popup if `KeyEventResult.handled` is returned.
+                          onChanged: handleSoftKeyboardInput,
+                        ).workaroundFreezeLinuxMint(),
+                    ),
             ),
           ];
           if (showCursorPaint) {
