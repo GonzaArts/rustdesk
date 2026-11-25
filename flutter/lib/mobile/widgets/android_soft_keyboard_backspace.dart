@@ -17,8 +17,9 @@ TextEditingValue? androidSoftKeyboardBackspaceValue(TextEditingValue value) {
       !value.composing.isCollapsed) {
     return null;
   }
-  final before = value.text.substring(0, selection.start);
-  final remaining = before.characters.skipLast(1).string;
+  final caret = CharacterRange.at(value.text, selection.start);
+  if (caret.stringBeforeLength != selection.start) return null;
+  final remaining = caret.stringBefore.characters.skipLast(1).string;
   return TextEditingValue(
     text: remaining + value.text.substring(selection.end),
     selection: TextSelection.collapsed(offset: remaining.length),
@@ -26,23 +27,22 @@ TextEditingValue? androidSoftKeyboardBackspaceValue(TextEditingValue value) {
 }
 
 /// Intercepts raw Backspace events from the focused Android soft-keyboard
-/// editor before they bubble to RawKeyFocusScope. Only the legacy text-change
-/// path dispatches the resulting VK_BACK, so a deletion is never sent twice.
-/// Other platforms and all other keys retain the existing path.
+/// editor before they bubble to RawKeyFocusScope. Mirrored edits go through the
+/// same controller listener as edits from the IME.
 class AndroidSoftKeyboardBackspaceGuard extends StatefulWidget {
   const AndroidSoftKeyboardBackspaceGuard({
     super.key,
     required this.enabled,
     required this.controller,
     required this.canHandle,
-    required this.onChanged,
+    required this.onEmptyBackspace,
     required this.child,
   });
 
   final bool enabled;
   final TextEditingController controller;
   final bool Function() canHandle;
-  final ValueChanged<String> onChanged;
+  final VoidCallback onEmptyBackspace;
   final Widget child;
 
   @override
@@ -54,43 +54,48 @@ class _AndroidSoftKeyboardBackspaceGuardState
     extends State<AndroidSoftKeyboardBackspaceGuard> {
   // Only consume the release of a key whose down event we consumed. Otherwise
   // a Backspace forwarded by the parent could be left pressed remotely.
-  bool _ownsBackspace = false;
+  PhysicalKeyboardKey? _ownedBackspace;
 
   KeyEventResult _handleKey(FocusNode node, KeyEvent event) {
     if (event.logicalKey != LogicalKeyboardKey.backspace) {
       return KeyEventResult.ignored;
     }
     if (event is KeyUpEvent) {
-      final owned = _ownsBackspace;
-      _ownsBackspace = false;
-      return owned ? KeyEventResult.handled : KeyEventResult.ignored;
+      if (_ownedBackspace != event.physicalKey) return KeyEventResult.ignored;
+      _ownedBackspace = null;
+      return KeyEventResult.handled;
     }
-    if (event is KeyDownEvent) {
-      _ownsBackspace = false;
-    } else if (event is! KeyRepeatEvent || !_ownsBackspace) {
+    final repeat = event is KeyRepeatEvent;
+    if (repeat && _ownedBackspace != event.physicalKey) {
       return KeyEventResult.ignored;
     }
+    if (!repeat) _ownedBackspace = null;
 
     final keyboard = HardwareKeyboard.instance;
     if (!widget.canHandle() ||
         keyboard.isControlPressed ||
         keyboard.isAltPressed ||
-        keyboard.isMetaPressed) {
-      return KeyEventResult.ignored;
+        keyboard.isMetaPressed ||
+        keyboard.isShiftPressed ||
+        event.synthesized) {
+      return repeat ? KeyEventResult.handled : KeyEventResult.ignored;
     }
 
-    final corrected = androidSoftKeyboardBackspaceValue(widget.controller.value);
-    if (corrected == null) {
-      // Active composition, selection, or exhausted padding: preserve the
-      // existing handling. Repeated events use the parent's press path.
-      return KeyEventResult.ignored;
+    final value = widget.controller.value;
+    final corrected = androidSoftKeyboardBackspaceValue(value);
+    final empty = value.text.isEmpty &&
+        value.selection == const TextSelection.collapsed(offset: 0) &&
+        value.composing.isCollapsed;
+    if (corrected == null && !empty) {
+      return repeat ? KeyEventResult.handled : KeyEventResult.ignored;
     }
 
-    _ownsBackspace = true;
-    // A programmatic controller write does not invoke TextField.onChanged.
-    // Explicitly invoke the same callback exactly once, after local editing.
-    widget.controller.value = corrected;
-    widget.onChanged(corrected.text);
+    _ownedBackspace = event.physicalKey;
+    if (corrected != null) {
+      widget.controller.value = corrected;
+    } else {
+      widget.onEmptyBackspace();
+    }
     return KeyEventResult.handled;
   }
 
@@ -100,6 +105,9 @@ class _AndroidSoftKeyboardBackspaceGuardState
     return Focus(
       canRequestFocus: false,
       skipTraversal: true,
+      onFocusChange: (focused) {
+        if (!focused) _ownedBackspace = null;
+      },
       onKeyEvent: _handleKey,
       child: widget.child,
     );

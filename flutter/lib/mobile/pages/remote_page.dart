@@ -23,9 +23,10 @@ import '../../models/model.dart';
 import '../../models/platform_model.dart';
 import '../../models/shortcut_model.dart';
 import '../../utils/image.dart';
-import '../widgets/dialog.dart';
-import '../widgets/custom_scale_widget.dart';
 import '../widgets/android_soft_keyboard_backspace.dart';
+import '../widgets/android_soft_keyboard_input.dart';
+import '../widgets/custom_scale_widget.dart';
+import '../widgets/dialog.dart';
 
 final initText = '1' * 1024;
 
@@ -113,6 +114,9 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
 
   final TextEditingController _textController =
       TextEditingController(text: initText);
+  late final _androidSoftKeyboard = AndroidSoftKeyboardInput()
+    ..reset(_textController.value);
+  late final _androidSoftKeyboardSends = AndroidSoftKeyboardDispatcher();
 
   _RemotePageState(String id) {
     initSharedStates(id);
@@ -123,6 +127,10 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
   @override
   void initState() {
     super.initState();
+    if (isAndroid) {
+      _textController.addListener(_onAndroidSoftKeyboardEdit);
+      _mobileFocusNode.addListener(_onAndroidSoftKeyboardFocus);
+    }
     gFFI.ffiModel.updateEventListener(sessionId, widget.id);
     gFFI.start(
       widget.id,
@@ -187,6 +195,11 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
 
   @override
   Future<void> dispose() async {
+    if (isAndroid) {
+      _androidSoftKeyboardSends.close();
+      _textController.removeListener(_onAndroidSoftKeyboardEdit);
+      _mobileFocusNode.removeListener(_onAndroidSoftKeyboardFocus);
+    }
     HardwareKeyboard.instance.removeHandler(_handleLocalKeyEvent);
     WidgetsBinding.instance.removeObserver(this);
     // Close the session up-front. `gFFI.close()` below only calls `sessionClose`
@@ -286,6 +299,12 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
 
   void onSoftKeyboardChanged(bool visible) {
     if (!visible) {
+      if (isAndroid && _showEdit) {
+        _timer?.cancel();
+        _showEdit = false;
+        _mobileFocusNode.unfocus();
+        _physicalFocusNode.requestFocus();
+      }
       SystemChrome.setEnabledSystemUIMode(SystemUiMode.manual, overlays: []);
       // [pi.version.isNotEmpty] -> check ready or not, avoid login without soft-keyboard
       if (gFFI.chatModel.chatWindowOverlayEntry == null &&
@@ -428,6 +447,79 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
     }
   }
 
+  bool get _allowsAndroidSoftKeyboardInput =>
+      gFFI.ffiModel.pi.isSet.isTrue &&
+      inputModel.keyboardInputAllowed &&
+      inputModel.keyboardPerm &&
+      !inputModel.isViewOnly &&
+      !inputModel.isViewCamera;
+
+  bool get _canEditAndroidSoftKeyboard =>
+      _showEdit && _mobileFocusNode.hasPrimaryFocus;
+
+  bool get _isAndroidSoftKeyboardModified =>
+      inputModel.ctrl ||
+      inputModel.alt ||
+      inputModel.shift ||
+      inputModel.command;
+
+  void _onAndroidSoftKeyboardFocus() {
+    if (!_mobileFocusNode.hasPrimaryFocus) {
+      _androidSoftKeyboard.invalidateReplay();
+    }
+  }
+
+  void _onAndroidSoftKeyboardEdit() {
+    final edit = _androidSoftKeyboard.update(
+      _textController.value,
+      send: _canEditAndroidSoftKeyboard && _allowsAndroidSoftKeyboardInput,
+      allowReplay: !_isAndroidSoftKeyboardModified,
+    );
+    _sendAndroidSoftKeyboardEdit(edit);
+  }
+
+  void _sendAndroidSoftKeyboardEdit(AndroidSoftKeyboardEdit edit) {
+    if (edit.isEmpty) return;
+    final target = sessionId;
+    final alt = inputModel.alt;
+    final ctrl = inputModel.ctrl;
+    final shift = inputModel.shift;
+    final command = inputModel.command;
+    Future<void> sendKey(String name) async {
+      if (!_allowsAndroidSoftKeyboardInput) return;
+      await bind.sessionInputKey(
+        sessionId: target,
+        name: name,
+        down: false,
+        press: true,
+        alt: alt,
+        ctrl: ctrl,
+        shift: shift,
+        command: command,
+      );
+    }
+
+    Future<void> sendText(String text) async {
+      if (text.isEmpty || !_allowsAndroidSoftKeyboardInput) return;
+      if (text == ' ') {
+        await sendKey('VK_SPACE');
+      } else if (text == '\n') {
+        await sendKey('VK_RETURN');
+      } else if (text.length == 1) {
+        await sendKey(text);
+      } else {
+        await bind.sessionInputString(sessionId: target, value: text);
+      }
+    }
+
+    for (var i = 0; i < edit.backspaces; i++) {
+      _androidSoftKeyboardSends.send(() => sendKey('VK_BACK'));
+    }
+    if (edit.text.isNotEmpty) {
+      _androidSoftKeyboardSends.send(() => sendText(edit.text));
+    }
+  }
+
   void inputChar(String char) {
     if (!inputModel.keyboardInputAllowed) {
       return;
@@ -466,8 +558,17 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
     inputModel.keyboardInputAllowed = true;
     gFFI.invokeMethod("enable_soft_keyboard", true);
     // destroy first, so that our _value trick can work
-    _value = initText;
-    _textController.text = _value;
+    if (isAndroid) {
+      final padded = TextEditingValue(
+        text: initText,
+        selection: TextSelection.collapsed(offset: initText.length),
+      );
+      _androidSoftKeyboard.reset(padded);
+      _textController.value = padded;
+    } else {
+      _value = initText;
+      _textController.text = _value;
+    }
     setState(() => _showEdit = false);
     _timer?.cancel();
     _timer = Timer(kMobileDelaySoftKeyboard, () {
@@ -584,12 +685,21 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
     );
   }
 
-  bool _handleLocalKeyEvent(KeyEvent event) => handleMobileLocalKeyEvent(event,
-      remoteFocused: _physicalFocusNode.hasPrimaryFocus, inputModel: inputModel);
+  bool _handleLocalKeyEvent(KeyEvent event) {
+    if (isAndroid &&
+        _canEditAndroidSoftKeyboard &&
+        event.logicalKey != LogicalKeyboardKey.backspace &&
+        (event is KeyDownEvent || event is KeyRepeatEvent)) {
+      _androidSoftKeyboard.invalidateReplay();
+    }
+    return handleMobileLocalKeyEvent(event,
+        remoteFocused: _physicalFocusNode.hasPrimaryFocus,
+        inputModel: inputModel);
+  }
 
   Widget getRawPointerAndKeyBody(Widget child) {
     final ffiModel = Provider.of<FfiModel>(context);
-    return RawPointerMouseRegion(
+    final body = RawPointerMouseRegion(
       cursor: ffiModel.keyboard ? SystemMouseCursors.none : MouseCursor.defer,
       inputModel: inputModel,
       // Disable RawKeyFocusScope before the connecting is established.
@@ -601,6 +711,16 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
               child: child)
           : child,
     );
+    return isAndroid
+        ? Listener(
+            onPointerDown: (_) {
+              if (_canEditAndroidSoftKeyboard) {
+                _androidSoftKeyboard.invalidateReplay();
+              }
+            },
+            child: body,
+          )
+        : body;
   }
 
   Widget getBottomAppBar() {
@@ -735,39 +855,35 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
                       enabled: isAndroid,
                       controller: _textController,
                       canHandle: () =>
-                          _mobileFocusNode.hasFocus &&
-                          inputModel.keyboardInputAllowed &&
-                          inputModel.keyboardPerm &&
-                          !inputModel.isViewOnly &&
-                          !inputModel.isViewCamera &&
-                          !inputModel.ctrl &&
-                          !inputModel.alt &&
-                          !inputModel.command,
-                      onChanged: handleSoftKeyboardInput,
+                          _canEditAndroidSoftKeyboard &&
+                          _allowsAndroidSoftKeyboardInput &&
+                          !_isAndroidSoftKeyboardModified,
+                      onEmptyBackspace: () => _sendAndroidSoftKeyboardEdit(
+                          const AndroidSoftKeyboardEdit(backspaces: 1)),
                       child: TextFormField(
-                          textInputAction: TextInputAction.newline,
-                          autocorrect: false,
-                          // Flutter 3.16.9 Android.
-                          // `enableSuggestions` causes secure keyboard to be shown.
-                          // https://github.com/flutter/flutter/issues/139143
-                          // https://github.com/flutter/flutter/issues/146540
-                          // enableSuggestions: false,
-                          autofocus: true,
-                          focusNode: _mobileFocusNode,
-                          maxLines: null,
-                          controller: _textController,
-                          // trick way to make backspace work always
-                          keyboardType: TextInputType.multiline,
-                          // `onChanged` may be called depending on the input method if this widget is wrapped in
-                          // `Focus(onKeyEvent: ..., child: ...)`
-                          // For `Backspace` button in the soft keyboard:
-                          // en/fr input method:
-                          //      1. The button will not trigger `onKeyEvent` if the text field is not empty.
-                          //      2. The button will trigger `onKeyEvent` if the text field is empty.
-                          // ko/zh/ja input method: the button will trigger `onKeyEvent`
-                          //                     and the event will not popup if `KeyEventResult.handled` is returned.
-                          onChanged: handleSoftKeyboardInput,
-                        ).workaroundFreezeLinuxMint(),
+                        textInputAction: TextInputAction.newline,
+                        autocorrect: false,
+                        // Flutter 3.16.9 Android.
+                        // `enableSuggestions` causes secure keyboard to be shown.
+                        // https://github.com/flutter/flutter/issues/139143
+                        // https://github.com/flutter/flutter/issues/146540
+                        // enableSuggestions: false,
+                        autofocus: true,
+                        focusNode: _mobileFocusNode,
+                        maxLines: null,
+                        controller: _textController,
+                        // trick way to make backspace work always
+                        keyboardType: TextInputType.multiline,
+                        // `onChanged` may be called depending on the input method if this widget is wrapped in
+                        // `Focus(onKeyEvent: ..., child: ...)`
+                        // For `Backspace` button in the soft keyboard:
+                        // en/fr input method:
+                        //      1. The button will not trigger `onKeyEvent` if the text field is not empty.
+                        //      2. The button will trigger `onKeyEvent` if the text field is empty.
+                        // ko/zh/ja input method: the button will trigger `onKeyEvent`
+                        //                     and the event will not popup if `KeyEventResult.handled` is returned.
+                        onChanged: isAndroid ? null : handleSoftKeyboardInput,
+                      ).workaroundFreezeLinuxMint(),
                     ),
             ),
           ];
